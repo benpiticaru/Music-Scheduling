@@ -1,285 +1,196 @@
+import os
 import numpy as np
 import pandas as pd
-from datetime import date
-import calendar
-from itertools import cycle, islice
-import argparse
+from datetime import datetime
+from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.preprocessing import LabelEncoder
 
-parser = argparse.ArgumentParser()
+# Constants for Google API setup
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly', 'https://www.googleapis.com/auth/calendar']
+SERVICE_ACCOUNT_FILE = 'path/to/service_account.json'  # Path to the service account JSON file
+SPREADSHEET_ID = 'your_google_form_spreadsheet_id'  # Google Sheets ID
+CALENDAR_ID = 'your_google_calendar_id'  # Google Calendar ID
 
-parser.add_argument("-i", "--input_file", default="C:/Users/Benjamin Piticaru/Downloads/January - April Leading survey (Responses) - Form Responses 1 (3).csv")
-parser.add_argument("-o", "--output_folder", default="C:/Users/Benjamin Piticaru/Documents/python projects/Music_Scheduling")
-parser.add_argument("-s", "--start_month", default="2024-05-01")
-parser.add_argument("-p", "--prayer_services",default="2024-07-10")
-parser.add_argument("-n", "--sermonettes",default="2024-07-31,2024-08-21")
+# Google API setup
+credentials = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+sheets_service = build('sheets', 'v4', credentials=credentials)
+calendar_service = build('calendar', 'v3', credentials=credentials)
 
-args = parser.parse_args()
+# Fetch data from Google Forms
+def fetch_google_form_data():
+    """
+    Fetches data from a Google Form linked to a Google Sheet.
+    Returns the data as a pandas DataFrame.
+    """
+    sheet = sheets_service.spreadsheets()
+    result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range='Form Responses 1').execute()
+    values = result.get('values', [])
+    if not values:
+        raise ValueError("No data found in the Google Form.")
+    headers = values[0]
+    data = pd.DataFrame(values[1:], columns=headers)
+    return data
 
-address = args.input_file
-output = args.output_folder
-begin_date = args.start_month
-prayer_services = args.prayer_services
-sermonettes = args.sermonettes
+# Fetch prayer services and sermonettes from Google Calendar
+def fetch_google_calendar_events():
+    """
+    Fetches events from Google Calendar and categorizes them as prayer services or sermonettes.
+    Returns two lists: prayer_services and sermonettes.
+    """
+    events_result = calendar_service.events().list(calendarId=CALENDAR_ID, singleEvents=True, orderBy='startTime').execute()
+    events = events_result.get('items', [])
+    prayer_services = []
+    sermonettes = []
+    for event in events:
+        if 'Prayer Service' in event.get('summary', ''):
+            prayer_services.append(event['start']['date'])
+        elif 'Sermonette' in event.get('summary', ''):
+            sermonettes.append(event['start']['date'])
+    return prayer_services, sermonettes
 
-survey_df = pd.read_csv(address)
-survey_df = survey_df.drop('Timestamp', axis=1)
-survey_df.columns = ['Name','email','phone','role','Zions Harp',
-                    'Gospel Hymns','Hymns of Zion','Celebration Hymnal',
-                    'Junior Hymnal', 'Camp Book','Dates off','Capacity','Weekly_preference']
-survey_df.set_index("Name",inplace=True)
-## Changing Inputs from Yes/No and capacity to bool and 3,2,1 respecively
-for column in survey_df.columns:
-    survey_df[column] = survey_df[column].map(lambda x: True if x == 'Yes' else (False if x == 'No' else x))
+# Prepare survey data
+def prepare_survey_data(data):
+    """
+    Prepares survey data by renaming columns, setting the index, and converting Yes/No values to boolean.
+    """
+    data.columns = ['Timestamp', 'Name', 'Email', 'Phone', 'Role', 'Zions Harp', 'Gospel Hymns', 'Hymns of Zion',
+                    'Celebration Hymnal', 'Junior Hymnal', 'Camp Book', 'Dates off', 'Capacity', 'Weekly preference']
+    data.set_index("Name", inplace=True)
+    for column in data.columns:
+        data[column] = data[column].map(lambda x: True if x == 'Yes' else (False if x == 'No' else x))
+    return data
 
-## Creating the lists of Capacity per month
-Leader_list = []
-Piano_list = []
+# Prepare decision tree data
+def prepare_decision_tree_data(survey_df, leader_list, pianist_list):
+    """
+    Prepares data for training a decision tree classifier.
+    Returns the training data and labels.
+    """
+    data = []
+    labels = []
+    for name in survey_df.index:
+        for subject in survey_df.columns:
+            if subject not in ['Dates off', 'Weekly preference', 'Capacity', 'Role']:
+                continue
+            for date in pd.date_range('2024-05-01', periods=120):
+                weekday = date.weekday()
+                start_time = '7:30:00 PM' if weekday == 2 else '5:15:00 PM'
+                is_leader = name in leader_list
+                is_pianist = name in pianist_list
+                is_available = str(date)[:10] not in Convert(survey_df.loc[name, 'Dates off'])
+                prefers_time = start_time in Convert(survey_df.loc[name, 'Weekly preference'])
+                plays_subject = survey_df.loc[name, subject]
+                data.append([name, subject, weekday, start_time, is_leader, is_pianist, is_available, prefers_time, plays_subject])
+                labels.append(1 if is_leader or is_pianist else 0)
+    return data, labels
 
-## The program multi_append(Str, num) produces a list with Str, n times.
-def multi_append(name, n):
-    l = []
-    for i in range(0,n):
-        l.append(name)
-    return l
+# Train decision tree
+def train_decision_tree(data, labels):
+    """
+    Trains a decision tree classifier using the provided data and labels.
+    Returns the trained classifier and a label encoder.
+    """
+    le = LabelEncoder()
+    data_encoded = [le.fit_transform(col) for col in zip(*data)]
+    clf = DecisionTreeClassifier()
+    clf.fit(list(zip(*data_encoded)), labels)
+    return clf, le
 
-## The program below creates a list of leaders/piano names * the number of times they are able to
-##   play a month
+# Decision tree-based selection
+def select_person(row, role_list, survey_df, previous_people, clf, le):
+    """
+    Selects a person for a role (leader or pianist) using a decision tree classifier.
+    Ensures the person meets all criteria.
+    """
+    candidates = []
+    for person in role_list:
+        weekday = row['Start Date'].weekday()
+        start_time = row['Start Time']
+        is_available = str(row['Start Date'])[:10] not in Convert(survey_df.loc[person, 'Dates off'])
+        prefers_time = start_time in Convert(survey_df.loc[person, 'Weekly preference'])
+        plays_subject = survey_df.loc[person, row['Subject']]
+        if all([is_available, prefers_time, plays_subject, person not in previous_people]):
+            candidates.append(person)
+    if not candidates:
+        return None
+    candidate_data = [[person, row['Subject'], weekday, start_time, person in role_list, True, True, True, True] for person in candidates]
+    candidate_data_encoded = [le.transform(col) for col in zip(*candidate_data)]
+    predictions = clf.predict(list(zip(*candidate_data_encoded)))
+    for i, prediction in enumerate(predictions):
+        if prediction == 1:
+            return candidates[i]
+    return None
 
-for index, row in survey_df.iterrows():
-    if row["Capacity"] == "0 (reserve)":
-        row["Capacity"] = 0
-    row["Capacity"] = int(row["Capacity"])
-    if row['role'] == 'Leader':
-        Leader_list.extend(multi_append(index, row['Capacity']))
-    elif row["role"] == 'Both':
-        Leader_list.extend(multi_append(index, row['Capacity'] // 2))
-        Piano_list.extend(multi_append(index, row['Capacity'] // 2))
-    else:
-        Piano_list.extend(multi_append(index, row['Capacity']))
-## Inputs the dates for 4 months, starting with start_month. 
-##   Change this out for the input option month.
-
-df = pd.DataFrame({'Start Date':pd.date_range(begin_date, periods=120),
-                   'End Date':pd.date_range(begin_date, periods=120)})
-dates_avail = pd.DataFrame(index=df['Start Date'],columns=(survey_df.index))
-
-## Filters out rows that are not wednesdays or Sundays
-for index, row in df.iterrows():
-    if row['Start Date'].weekday() == 6:
-        continue
-    elif row['Start Date'].weekday() == 2:
-        continue
-    else:
-        df.drop(index, inplace=True)
-
-## Creates Additional Sunday placement.
-temp_df = []
-for index, row in df.iterrows():
-    if row['Start Date'].weekday() == 6:
-        temp_df.extend([list(row)]*2)
-    else:
-        temp_df.append(list(row))
-
-df = pd.DataFrame(temp_df, columns=df.columns)
-
-## Implementing Sit/Stand format
-def format(row):
-    if row['Start Date'].weekday() == 6:
-        return 'Sit'
-    else:
-        return    
-
-df['format'] = df.apply(lambda row: format(row), axis=1)
-
-if df.loc[0,'Start Date'].weekday() == 6:
-    df.loc[0,'format'] = None
-else:
-    df.loc[1,'format'] = None
-
-for i in range(3, len(df) - 1):
-    if df.loc[i-2,'format'] != None:
-        df.loc[i,'format'] = None
-    elif df.loc[i-3,'format'] == 'Sit':
-        df.loc[i,'format'] = 'Stand'
-    else:
-        continue
-
-## Adding start and stop times
-def start_time_of_day(row):
-    if row['Start Date'].weekday() == 6:
-        if row['format'] == None:
-            return '4:40:00 PM'
-        else:
-            return '5:15:00 PM'
-    else:
-        return '7:30:00 PM'
-
-def end_time_of_day(row):
-    if row['Start Date'].weekday() == 6:
-        if row['format'] == None:
-            return '5:15:00 PM'
-        else:
-            return '5:45:00 PM'
-    else:
-        return '7:55:00 PM'
-
-df['Start Time'] = df.apply(lambda row: start_time_of_day(row), axis=1)
-df['End Time'] = df.apply(lambda row: end_time_of_day(row), axis=1)
-
-book_list = ['Gospel Hymns','Celebration Hymnal','Gospel Hymns','Hymns of Zion','Gospel Hymns',
-             'Junior Hymnal','Gospel Hymns','Camp Book']
-
-wed_book_list = ["Zions Harp","Gospel Hymns"]
-pos = 0
-pos2 = 0
-df['Subject'] = 'Zions Harp'
-for index, row in df.iterrows():
-    if pos >= len(book_list):
-        pos = 0
-    if row['Start Date'].weekday() == 6:
-        if "4:40" in row['Start Time']:
-            df.loc[index,'Subject'] = 'Zions Harp'
-        else:
-            df.loc[index,'Subject'] = book_list[pos]
-            pos += 1
-    else: 
-        df.loc[index,'Subject'] = wed_book_list[pos2]
-        pos2 += 1
-    if pos2 > 1:
-        pos2 = 0
-    row['Start Date'] = str(row['Start Date'])[:10]
-    row['End Date'] = str(row['End Date'])[:10]
-
-## The function below takes a list and returns a random value from the list without replacing it.
-def rm_from_lst(los,x):
-    for i in range(len(los)):
-        if (los[i] == x):
-            los.remove(los[i])
-
-## Convert(str) takes in a string and returns a list of the string
-##   broken up by a ','
-def Convert(s):
-    if type(s) == float:
-        return []
-    if '-' in s:
-        li = (s.replace(' ', ''))
-        li = list(s.split(","))
-        return li
-    else:
-        return []
-    
-## Creating the Leader and Pianist columns
-df['Leader'] = ''
-df['Pianist'] = ''
-
-## The code below splits the main schedule into 4 schedules for each month
-sched_1 = df[df['Start Date'].dt.strftime('%Y-%m') == '2024-05']
-sched_2 = df[df['Start Date'].dt.strftime('%Y-%m') == '2024-06']
-sched_3 = df[df['Start Date'].dt.strftime('%Y-%m') == '2024-07']
-sched_4 = df[df['Start Date'].dt.strftime('%Y-%m') == '2024-08']
-
-## need to replace from list if name is not chosen.
-## Populates leaders
-
-def remove_third(los):
-    if len(los) > 3:
-        los = los[1:]
-    return los
-
-def time_to_name(t):
-    name = "Wednesday"
-    if t == '5:15:00 PM':
-        name = "Sunday (1st Half)"
-    elif t == '5:45:00 PM':
-        name = "Sunday (2nd Half)"
-    return name
-
-previous_leaders = []
-previous_pianists = []
-
-def fill_schedule(df, leader_list, pianist_list, survey_df, prayer_services, sermonettes):
-
+# Fill schedule
+def fill_schedule(df, leader_list, pianist_list, survey_df, prayer_services, sermonettes, clf, le):
+    """
+    Fills the schedule DataFrame with leaders and pianists based on availability and preferences.
+    Updates the schedule with prayer services and sermonettes.
+    """
+    previous_leaders = []
+    previous_pianists = []
     for index, row in df.iterrows():
-        # Select a leader and pianist
-        leader = np.random.choice(leader_list)
-        pianist = np.random.choice(pianist_list)
-        # Retrieve start time
-        start_time = time_to_name(row['Start Time'])
-        # Ensure leader and pianist meet criteria
-        while not all([
-            survey_df.loc[leader, row['Subject']],
-            start_time in survey_df.loc[leader, 'Weekly_preference'],
-            str(row['Start Date'])[:10] not in survey_df.loc[leader, 'Dates off'],
-            leader not in previous_leaders,
-            leader != pianist
-        ]):
-            leader = np.random.choice(leader_list)
-
-        while not all([
-            survey_df.loc[pianist, row['Subject']],
-            start_time in survey_df.loc[pianist, 'Weekly_preference'],
-            str(row['Start Date'])[:10] not in survey_df.loc[pianist, 'Dates off'],
-            pianist not in previous_pianists,
-            leader != pianist
-        ]):
-            pianist = np.random.choice(pianist_list)
-        # Assign leader and pianist
-        df.at[index, 'Leader'] = leader
-        df.at[index, 'Pianist'] = pianist
-
-        for los,s in [(previous_leaders,leader),(previous_pianists,pianist)]:
-            los.append(s)
-            if len(los) > 3:
-                los.pop(0)
-
-        # Update subject based on dates
+        leader = select_person(row, leader_list, survey_df, previous_leaders, clf, le)
+        pianist = select_person(row, pianist_list, survey_df, previous_pianists, clf, le)
+        if leader:
+            df.at[index, 'Leader'] = leader
+            previous_leaders.append(leader)
+            if len(previous_leaders) > 3:
+                previous_leaders.pop(0)
+        if pianist:
+            df.at[index, 'Pianist'] = pianist
+            previous_pianists.append(pianist)
+            if len(previous_pianists) > 3:
+                previous_pianists.pop(0)
         if str(row['Start Date'])[:10] in prayer_services:
             df.at[index, 'Subject'] = "Prayer Service"
-        elif str(row['Start Date'])[:10] in sermonettes: 
+        elif str(row['Start Date'])[:10] in sermonettes:
             df.at[index, 'Subject'] = "Sermonette"
 
-# Create an empty DataFrame
-main_schedule = pd.DataFrame()
+# Create Google Calendar events
+def create_google_calendar_events(schedule_df):
+    """
+    Creates events in Google Calendar based on the schedule DataFrame.
+    """
+    for _, row in schedule_df.iterrows():
+        event = {
+            'summary': row['Subject'],
+            'description': f"Leader: {row['Leader']}, Pianist: {row['Pianist']}",
+            'start': {'dateTime': f"{row['Start Date']}T{row['Start Time']}", 'timeZone': 'UTC'},
+            'end': {'dateTime': f"{row['End Date']}T{row['End Time']}", 'timeZone': 'UTC'},
+        }
+        calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
 
-# Iterate through schedules and fill them
-for schedule in [sched_1, sched_2, sched_3, sched_4]:
-    fill_schedule(schedule, Leader_list, Piano_list, survey_df, prayer_services, sermonettes)
-    main_schedule = pd.concat([main_schedule, schedule], ignore_index=True)
+# Main function
+def main():
+    """
+    Main function to fetch data, process the schedule, and upload it to Google Calendar.
+    """
+    # Fetch data
+    form_data = fetch_google_form_data()
+    prayer_services, sermonettes = fetch_google_calendar_events()
+    
+    # Prepare data
+    survey_df = prepare_survey_data(form_data)
+    leader_list, pianist_list = [], []  # Populate based on survey_df
+    data, labels = prepare_decision_tree_data(survey_df, leader_list, pianist_list)
+    clf, le = train_decision_tree(data, labels)
+    
+    # Generate schedule
+    df = pd.DataFrame({'Start Date': pd.date_range('2024-05-01', periods=120), 'End Date': pd.date_range('2024-05-01', periods=120)})
+    df['Start Time'] = '7:30:00 PM'
+    df['End Time'] = '7:55:00 PM'
+    df['Subject'] = 'Zions Harp'
+    df['Leader'] = ''
+    df['Pianist'] = ''
+    fill_schedule(df, leader_list, pianist_list, survey_df, prayer_services, sermonettes, clf, le)
+    
+    # Export schedule
+    df.to_csv('Music_Schedule.csv')
+    create_google_calendar_events(df)
+    print("Schedule created and uploaded to Google Calendar.")
 
-final_df = main_schedule.filter(['Subject','Start Date','End Date', 'Start Time','End Time'],axis=1)
-
-## The following code writes the description column for the final df.
-def write_description(row):
-    string = 'Leader: {leader} | Pianist: {pianist} \n Format: {format}'.format(leader=row['Leader'],pianist=row['Pianist'],format=row['format'])
-    return string
-
-final_df['Description'] = main_schedule.apply(lambda row: write_description(row), axis=1)
-
-final_df.to_csv('Music_Schedule.csv')
-
-## make_pdf(df) takes the shedule dataframe and outputs a new dataframe that is the pdf version of the schedule.
-def make_pdf(df):
-    new_df = pd.DataFrame(np.arange(216).reshape(18,12)).astype(str)
-    i = 0
-    for index, row in df.iterrows():
-        if row['Start Date'].weekday() == 6:
-            if row['Start Time'] == '4:40:00 PM':
-                new_df.iloc[i,1] = row['Leader']
-                new_df.iloc[i,2] = row['Pianist']
-            else:
-                new_df.iloc[i,0] = str(row['Start Date'])[:10]
-                new_df.iloc[i,3] = row['Leader']
-                new_df.iloc[i,4] = row['Pianist']
-                new_df.iloc[i,5] = row['format']
-                new_df.iloc[i,6] = row['Subject']
-        else:
-            new_df.iloc[i,8] = str(row['Start Date'])[:10]
-            new_df.iloc[i,9] = row['Leader']
-            new_df.iloc[i,10] = row['Pianist']
-            new_df.iloc[i,11] = row['Subject']
-            i += 1
-    return new_df
-
-pdf = make_pdf(main_schedule)
-pdf.to_csv('Music_schedule_pdf_version.csv')
-print("Program Complete.")
+if __name__ == "__main__":
+    main()
